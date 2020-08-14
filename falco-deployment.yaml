@@ -1,0 +1,208 @@
+---
+apiVersion: rbac.authorization.k8s.io/v1beta1
+kind: ClusterRole
+metadata:
+  name: fluentd-spring
+rules:
+  - apiGroups: [""]
+    resources:
+      - namespaces
+      - pods
+      - pods/logs
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1beta1
+kind: ClusterRoleBinding
+metadata:
+  name: fluentd-role-binding
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: fluentd-spring
+subjects:
+- kind: ServiceAccount
+  name: falco
+  namespace: default
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: fluentd-spring-config
+  namespace: default
+  labels:
+    k8s-app: fluentd-cloudwatch
+data:
+  fluent.conf: |
+    @include containers.conf
+    <match fluent.**>
+      @type null
+    </match> 
+  containers.conf: |
+    <source>
+      @type tail
+      @id in_tail_container_logs
+      @label @containers
+      path /var/log/*.log
+      pos_file /usr/local/fluentd-containers.log.pos
+      tag *
+      read_from_head true
+      <parse>
+        @type none
+        # @type json
+        # time_format %Y-%m-%dT%H:%M:%S.%NZ
+      </parse>
+    </source>
+
+    <label @containers>
+      <filter **>
+        @type kubernetes_metadata
+        @id filter_kube_metadata
+      </filter>
+ 
+      <filter **>
+        @type record_transformer
+        @id filter_containers_stream_transformer
+        <record>
+          stream_name springlogs #
+        </record>
+      </filter>
+ 
+      <filter **>
+        @type concat
+        key log
+        multiline_start_regexp /^\S/
+        separator ""
+        flush_interval 5
+        timeout_label @NORMAL
+      </filter>
+ 
+      <match **>
+        @type relabel
+        @label @NORMAL
+      </match>
+    </label>
+ 
+    <label @NORMAL>
+      <match **>
+        @type cloudwatch_logs
+        @id out_cloudwatch_logs_containers
+        region "us-west-2"
+        log_group_name "/aws/containerinsights/robotshop/springapp"
+        log_stream_name_key stream_name
+        remove_log_stream_name_key true
+        auto_create_stream true
+        <buffer>
+          flush_interval 5
+          chunk_limit_size 2m
+          queued_chunks_limit_size 32
+          retry_forever true
+        </buffer>
+      </match>
+    </label> 
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: fargate-log-gen
+  namespace: default
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: falco
+      k8s-app: fluentd-cloudwatch
+  template:
+    metadata:
+      labels:
+        app: falco
+        k8s-app: fluentd-cloudwatch
+      annotations:
+        iam.amazonaws.com/role: falco
+    spec:
+      volumes:
+        - name: fluentdconf
+          configMap:
+            name: fluentd-spring-config
+        - name: app-logs
+          emptyDir: {}
+      serviceAccount: falco
+      serviceAccountName: falco
+      containers:
+        - name: falco
+          image: registry.hub.docker.com/krisnova/falco-trace-vulnerableserver:latest
+          ports:
+            - name: https
+              containerPort: 443
+        - name: app
+          image: busybox
+          command: ['sh', '-c']
+          args:
+          - >
+            while true;
+            do echo "Time: $(date) $(cat /dev/urandom | tr -dc a-zA-Z0-9 | fold -w 1024 | head -n 1)" | tee -a /var/log/application.log;
+            sleep 1;
+            done;
+          imagePullPolicy: Always
+          volumeMounts:
+          - mountPath: /var/log
+            name: app-logs
+          resources:
+            requests:
+              cpu: 200m
+              memory: 0.5Gi
+            limits:
+              cpu: 400m
+              memory: 1Gi
+          securityContext:
+            privileged: false
+            readOnlyRootFilesystem: false
+            allowPrivilegeEscalation: false
+        - name: logrotate
+          image: realz/logrotate
+          volumeMounts:
+          - mountPath: /var/log
+            name: app-logs
+          env:
+          - name: CRON_EXPR
+            value: "*/15 * * * *"
+          - name: LOGROTATE_LOGFILES
+            value: "/var/log/*.log"
+          - name: LOGROTATE_FILESIZE
+            value: "50M"
+          - name: LOGROTATE_FILENUM
+            value: "5"
+        - name: fluentd
+          image: fluent/fluentd-kubernetes-daemonset:v1.9.3-debian-cloudwatch-1.0
+          env:
+          - name: REGION
+            value: us-west-2
+          - name: AWS_REGION
+            value: us-west-2
+          - name: CLUSTER_NAME
+            value: robotshop
+          - name: CI_VERSION
+            value: "k8s/1.0.1"
+          resources:
+            limits:
+              memory: 400Mi
+            requests:
+              cpu: 100m
+              memory: 200Mi
+          volumeMounts:
+          - name: fluentdconf
+            mountPath: /fluentd/etc
+          - name: app-logs
+            mountPath: /var/log
+---
+apiVersion: v1
+kind: Service
+metadata:
+  namespace: default
+  name: falco
+spec:
+  selector:
+    app: falco
+  ports:
+    - port: 443
+      targetPort: 443
+  type: NodePort
